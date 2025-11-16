@@ -1367,7 +1367,7 @@ fn start_datasource_loop(
                 datasource::Operation::Insert(docs) => {
                     if let Err(e) = write_side
                         .insert_documents(
-                            WriteApiKey::ApiKey(write_side.master_api_key.clone()),
+                            WriteApiKey::ApiKey(write_side.master_api_key),
                             sync_msg.collection_id,
                             sync_msg.index_id,
                             docs,
@@ -1385,7 +1385,7 @@ fn start_datasource_loop(
                 datasource::Operation::Delete(keys_to_remove) => {
                     if let Err(e) = write_side
                         .delete_documents(
-                            WriteApiKey::ApiKey(write_side.master_api_key.clone()),
+                            WriteApiKey::ApiKey(write_side.master_api_key),
                             sync_msg.collection_id,
                             sync_msg.index_id,
                             keys_to_remove,

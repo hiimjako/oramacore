@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use oramacore_lib::fs::create_if_not_exists;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time};
 use thiserror::Error;
@@ -63,7 +63,7 @@ impl Fetcher {
 
     pub async fn delete(
         &self,
-        base_dir: &PathBuf,
+        base_dir: &Path,
         collection_id: CollectionId,
         index_id: IndexId,
     ) -> Result<()> {
@@ -173,7 +173,7 @@ impl DatasourceStorage {
 
         let fetchers_to_delete: Vec<_> = keys_to_remove
             .iter()
-            .filter_map(|key| m.remove(key).map(|f| (key.clone(), f)))
+            .filter_map(|key| m.remove(key).map(|f| (*key, f)))
             .collect();
 
         self.save_dump_to_disk(&m).await?;
@@ -221,11 +221,9 @@ impl DatasourceStorage {
     fn load_dump_from_disk(file_path: &PathBuf) -> Result<CollectionDatasources> {
         if file_path.exists() {
             let file = std::fs::File::open(file_path)
-                .with_context(|| format!("Cannot open datasources.json at {:?}", file_path))?;
+                .with_context(|| format!("Cannot open datasources.json at {file_path:?}"))?;
             let serializable_vec: Vec<SerializableDatasourceEntry> = serde_json::from_reader(file)
-                .with_context(|| {
-                    format!("Cannot deserialize datasources.json at {:?}", file_path)
-                })?;
+                .with_context(|| format!("Cannot deserialize datasources.json at {file_path:?}"))?;
 
             Ok(serializable_vec
                 .into_iter()
@@ -263,7 +261,7 @@ impl DatasourceStorage {
 
         tokio::fs::write(&file_path_tmp, content)
             .await
-            .with_context(|| format!("Cannot create datasources.json at {:?}", file_path_tmp))?;
+            .with_context(|| format!("Cannot create datasources.json at {file_path_tmp:?}"))?;
 
         tokio::fs::rename(&file_path_tmp, &self.file_path)
             .await
@@ -315,8 +313,8 @@ impl DatasourceStorage {
                                     index_operation_sender.clone(),
                                 );
                                 let kind = kind.clone();
-                                let c_id = collection_id.clone();
-                                let i_id = index_id.clone();
+                                let c_id = *collection_id;
+                                let i_id = *index_id;
                                 tasks.spawn(async move {
                                     let _guard = InUseGuard { wrapper: kind };
                                     if let Err(e) = task.await {
@@ -340,12 +338,10 @@ impl DatasourceStorage {
                                     index_operation_sender.clone(),
                                 );
                                 let kind = kind.clone();
-                                let c_id = collection_id.clone();
-                                let i_id = index_id.clone();
                                 tasks.spawn(async move {
                                     let _guard = InUseGuard { wrapper: kind };
                                     if let Err(e) = task.await {
-                                        error!("Datasource sync ({} {}) task failed: {:?}", c_id, i_id,e);
+                                        error!("Datasource sync ({collection_id} {index_id}) task failed: {e:?}");
                                     }
                                 });
                             }
@@ -425,8 +421,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = DatasourceStorage::try_new(&temp_dir.path().to_path_buf()).unwrap();
 
-        let coll_id = CollectionId::try_new("coll1".to_string()).unwrap();
-        let index_id = IndexId::try_new("idx1".to_string()).unwrap();
+        let coll_id = CollectionId::try_new("coll1").unwrap();
+        let index_id = IndexId::try_new("idx1").unwrap();
 
         let fetcher = Fetcher::S3(s3::S3Fetcher {
             bucket: "bucket1".to_string(),
@@ -450,8 +446,8 @@ mod tests {
         let temp_path = &temp_dir.path().to_path_buf();
         let storage = DatasourceStorage::try_new(temp_path).unwrap();
 
-        let coll_id = CollectionId::try_new("coll1".to_string()).unwrap();
-        let index_id = IndexId::try_new("idx1".to_string()).unwrap();
+        let coll_id = CollectionId::try_new("coll1").unwrap();
+        let index_id = IndexId::try_new("idx1").unwrap();
 
         let fetcher = Fetcher::S3(s3::S3Fetcher {
             bucket: bucket_name,
@@ -478,8 +474,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = DatasourceStorage::try_new(&temp_dir.path().to_path_buf()).unwrap();
 
-        let coll_id = CollectionId::try_new("coll1".to_string()).unwrap();
-        let index_id = IndexId::try_new("idx1".to_string()).unwrap();
+        let coll_id = CollectionId::try_new("coll1").unwrap();
+        let index_id = IndexId::try_new("idx1").unwrap();
 
         let fetcher = Fetcher::S3(s3::S3Fetcher {
             bucket: bucket_name,
@@ -507,8 +503,8 @@ mod tests {
         let temp_path = &temp_dir.path().to_path_buf();
         let storage = DatasourceStorage::try_new(temp_path).unwrap();
 
-        let coll_id = CollectionId::try_new("coll1".to_string()).unwrap();
-        let index_id = IndexId::try_new("idx1".to_string()).unwrap();
+        let coll_id = CollectionId::try_new("coll1").unwrap();
+        let index_id = IndexId::try_new("idx1").unwrap();
 
         let fetcher = Fetcher::S3(s3::S3Fetcher {
             bucket: bucket_name,
@@ -518,7 +514,7 @@ mod tests {
             endpoint_url: Some(endpoint_url),
         });
 
-        let db_name = format!("{}_{}.db", coll_id, index_id);
+        let db_name = s3::S3Fetcher::sync_state_filename(coll_id, index_id);
         let db_path = temp_path.join(db_name);
 
         storage
@@ -562,7 +558,7 @@ mod tests {
 
         // Set flag to true, simulating the start of a task
         wrapper.in_use.store(true, Ordering::Relaxed);
-        assert_eq!(wrapper.in_use.load(Ordering::Relaxed), true);
+        assert!(wrapper.in_use.load(Ordering::Relaxed));
 
         let wrapper_clone = wrapper.clone();
         let result = panic::catch_unwind(move || {
@@ -573,7 +569,7 @@ mod tests {
         });
 
         assert!(result.is_err());
-        assert_eq!(wrapper.in_use.load(Ordering::Relaxed), false);
+        assert!(!wrapper.in_use.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -593,8 +589,7 @@ mod tests {
                 let err_msg = e.to_string();
                 assert!(
                     err_msg.contains("Cannot deserialize datasources.json"),
-                    "Error message did not contain expected text. Got: {}",
-                    err_msg
+                    "Error message did not contain expected text. Got: {err_msg}"
                 );
             }
         }
