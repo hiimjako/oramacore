@@ -267,7 +267,9 @@ impl DatasourceStorage {
 
         tokio::fs::rename(&file_path_tmp, &self.file_path)
             .await
-            .with_context(|| format!("Cannot rename {:?} to {:?}", file_path_tmp, self.file_path))?;
+            .with_context(|| {
+                format!("Cannot rename {:?} to {:?}", file_path_tmp, self.file_path)
+            })?;
 
         Ok(())
     }
@@ -388,14 +390,9 @@ impl DatasourceStorage {
         match &datasource {
             Fetcher::S3(s3_datasource) => {
                 let s3_datasource = s3_datasource.clone();
-                // TODO: update resy to implement async correctly
+                let handle = tokio::runtime::Handle::current();
                 tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-
-                    rt.block_on(async {
+                    handle.block_on(async {
                         match s3_datasource
                             .sync(
                                 datasource_dir_clone,

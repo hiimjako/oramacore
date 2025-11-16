@@ -9,6 +9,7 @@ use resy::remotes::aws::{Change, S3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
+use tokio_stream::StreamExt;
 use tracing::error;
 
 use crate::collection_manager::sides::write::datasource::{IndexOperation, Operation};
@@ -53,12 +54,12 @@ impl S3Fetcher {
     }
 
     pub fn sync_state_filename(collection_id: CollectionId, index_id: IndexId) -> String {
-        format!("{}_{}.db", collection_id, index_id)
+        format!("{collection_id}_{index_id}.db")
     }
 
     pub async fn remove_sync_state_file(
         &self,
-        base_dir: &PathBuf,
+        base_dir: &std::path::Path,
         collection_id: CollectionId,
         index_id: IndexId,
     ) -> Result<()> {
@@ -93,63 +94,74 @@ impl S3Fetcher {
         index_operation_sender: tokio::sync::mpsc::Sender<IndexOperation>,
     ) -> Result<(), SyncError> {
         let s3_client = self.create_s3_client();
-        let mut s3_diff_client = S3::from_client(s3_client.clone(), self.bucket.clone());
+        let s3_diff_client = S3::from_client(s3_client.clone(), self.bucket.clone());
 
         let mut docs_to_insert = Vec::with_capacity(BATCH_SIZE);
         let mut keys_to_remove = Vec::with_capacity(BATCH_SIZE);
 
         let db_name = Self::sync_state_filename(collection_id, index_id);
         let db_path = datasource_dir.join(db_name);
-        if let Err(e) = s3_diff_client
-            .stream_diff_and_update(db_path.as_path(), async |change| {
-                match change {
-                    Change::Added(obj) => {
-                        match S3Fetcher::fetch_document(&s3_client, &self.bucket, &obj.key).await {
-                            Ok(doc) => docs_to_insert.push(doc),
-                            Err(e) => {
-                                error!(error = ?e, key = %obj.key, "Failed to fetch new document");
+
+        let mut stream = s3_diff_client.stream_diff_and_update(db_path.as_path());
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(change) => {
+                    match change {
+                        Change::Added(obj) => {
+                            match S3Fetcher::fetch_document(&s3_client, &self.bucket, &obj.key)
+                                .await
+                            {
+                                Ok(doc) => docs_to_insert.push(doc),
+                                Err(e) => {
+                                    error!(error = ?e, key = %obj.key, "Failed to fetch new document");
+                                }
                             }
                         }
-                    }
-                    Change::Modified { old: _, new } => {
-                        match S3Fetcher::fetch_document(&s3_client, &self.bucket, &new.key).await {
-                            Ok(doc) => docs_to_insert.push(doc),
-                            Err(e) => {
-                                error!(error = ?e, key = %new.key, "Failed to fetch modified document");
+                        Change::Modified { old: _, new } => {
+                            match S3Fetcher::fetch_document(&s3_client, &self.bucket, &new.key)
+                                .await
+                            {
+                                Ok(doc) => docs_to_insert.push(doc),
+                                Err(e) => {
+                                    error!(error = ?e, key = %new.key, "Failed to fetch modified document");
+                                }
                             }
                         }
+                        Change::Deleted(obj) => {
+                            keys_to_remove.push(obj.key);
+                        }
                     }
-                    Change::Deleted(obj) => {
-                        keys_to_remove.push(obj.key);
+                    if docs_to_insert.len() >= BATCH_SIZE {
+                        let docs = std::mem::take(&mut docs_to_insert);
+                        if let Err(e) = index_operation_sender
+                            .send(IndexOperation {
+                                collection_id,
+                                index_id,
+                                operation: Operation::Insert(DocumentList(docs)),
+                            })
+                            .await
+                        {
+                            error!(error = ?e, "Failed to send insert operation for batch");
+                        }
+                    }
+                    if keys_to_remove.len() >= BATCH_SIZE {
+                        let keys = std::mem::take(&mut keys_to_remove);
+                        if let Err(e) = index_operation_sender
+                            .send(IndexOperation {
+                                collection_id,
+                                index_id,
+                                operation: Operation::Delete(keys),
+                            })
+                            .await
+                        {
+                            error!(error = ?e, "Failed to send delete operation for batch");
+                        }
                     }
                 }
-                if docs_to_insert.len() >= BATCH_SIZE {
-                    let docs = std::mem::take(&mut docs_to_insert);
-                    index_operation_sender
-                        .send(IndexOperation {
-                            collection_id,
-                            index_id,
-                            operation: Operation::Insert(DocumentList(docs)),
-                        })
-                        .await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                Err(err) => {
+                    error!(error = ?err, "Failed to process S3 change");
                 }
-                if keys_to_remove.len() >= BATCH_SIZE {
-                    let keys = std::mem::take(&mut keys_to_remove);
-                    index_operation_sender
-                        .send(IndexOperation {
-                            collection_id,
-                            index_id,
-                            operation: Operation::Delete(keys),
-                        })
-                        .await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                }
-                Ok(())
-            })
-            .await
-        {
-            return Err(SyncError::Failed(anyhow::anyhow!(e)));
+            };
         }
 
         if !docs_to_insert.is_empty() {
@@ -182,7 +194,7 @@ impl S3Fetcher {
             .key(key)
             .send()
             .await
-            .with_context(|| format!("Failed to get object from S3 key: {}", key))?;
+            .with_context(|| format!("Failed to get object from S3 key: {key}"))?;
 
         let body = obj
             .body
@@ -248,7 +260,7 @@ mod tests {
         let num_files = BATCH_SIZE + 1;
         let mut expected_keys = HashSet::new();
         for i in 0..num_files {
-            let key = format!("test-file-{}.json", i);
+            let key = format!("test-file-{i}.json");
             let content = json!({ "message": format!("Hello, Oramacore! (file {})", i) });
             let content_bytes = serde_json::to_vec(&content).unwrap();
 
