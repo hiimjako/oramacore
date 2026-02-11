@@ -8,6 +8,7 @@ mod batch_get_documents;
 mod boost_integration;
 mod bugs;
 mod claim_limitations;
+mod collection_values;
 mod commit;
 mod concurrency;
 mod customer_jwt_search;
